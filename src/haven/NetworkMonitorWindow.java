@@ -32,9 +32,11 @@ public class NetworkMonitorWindow extends Window {
     private final CheckBox showIn, showOut, follow, hideNoisy;
     private final Label status;
     private final List<NetPacketLog.Entry> filtered = new ArrayList<>();
+    private final java.util.function.Consumer<NetPacketLog.Entry> onpacket = e -> dirty = true;
     private volatile boolean dirty = true;
     private double lastRebuild = -1;
     private NetPacketLog.Entry shownDetail = null;
+    private String shownStatus = null;
 
     public NetworkMonitorWindow(Session sess) {
 	super(UI.scale(1190, 430), "Network Monitor");
@@ -80,7 +82,7 @@ public class NetworkMonitorWindow extends Window {
 	add(new Label("Details (click a message)"), list.pos("ur").adds(10, 0));
 	detail = add(new Scrollport(UI.scale(420, 320)), list.pos("ur").adds(10, 20));
 
-	sess.netlog.addListener(e -> dirty = true);
+	sess.netlog.addListener(onpacket);
 
 	prev = add(new Button(UI.scale(120), "Replay Selected", false) {
 		public void click() {
@@ -109,6 +111,16 @@ public class NetworkMonitorWindow extends Window {
 	pack();
     }
 
+    /* Detaching from the log matters for more than tidiness: the listener is
+     * what makes NetPacketLog record at all, so leaving it attached would keep
+     * the log (and this window, which the closure references) alive and
+     * collecting for the rest of the session. */
+    public void destroy() {
+	sess.netlog.removeListener(onpacket);
+	Utils.setprefc("wndc-netmon", this.c);
+	super.destroy();
+    }
+
     public void tick(double dt) {
 	if(dirty) {
 	    double now = Utils.rtime();
@@ -117,7 +129,12 @@ public class NetworkMonitorWindow extends Window {
 		lastRebuild = now;
 	    }
 	}
-	status.settext(filtered.size() + " / " + sess.netlog.entries().size() + " shown");
+	/* Label.settext re-renders unconditionally in this fork (its
+	 * short-circuit is commented out), so only call it on real changes --
+	 * otherwise this is a font render plus texture upload every frame. */
+	String st = filtered.size() + " / " + sess.netlog.size() + " shown";
+	if(!st.equals(shownStatus))
+	    status.settext(shownStatus = st);
 	if(list.sel != shownDetail)
 	    rebuilddetail();
 	super.tick(dt);
@@ -137,8 +154,42 @@ public class NetworkMonitorWindow extends Window {
 	    if(line.length() > detailMaxChars)
 		line = line.substring(0, detailMaxChars - 3) + "...";
 	    if(!line.isEmpty())
-		detail.cont.add(new Label(line, detailf), Coord.of(0, y));
+		detail.cont.add(new DetailLine(line), Coord.of(0, y));
 	    y += detailLineh;
+	}
+    }
+
+    /* A plain Label renders its texture in the constructor, so rebuilding a
+     * few hundred of them on a single click would mean that many font renders
+     * and texture uploads in one frame. Scrollport skips drawing off-screen
+     * children, so deferring the render to draw() means only the lines
+     * actually scrolled into view ever cost anything. */
+    private static class DetailLine extends Widget {
+	private final String text;
+	private Tex tex = null;
+
+	DetailLine(String text) {
+	    super(Coord.of(UI.scale(420), detailLineh));
+	    this.text = text;
+	}
+
+	public void draw(GOut g) {
+	    try {
+		if(tex == null)
+		    tex = detailf.render(text).tex();
+		g.image(tex, Coord.z);
+	    } catch(Loading l) {
+		/* Font not ready yet; try again next frame. */
+	    }
+	    super.draw(g);
+	}
+
+	public void dispose() {
+	    if(tex != null) {
+		tex.dispose();
+		tex = null;
+	    }
+	    super.dispose();
 	}
     }
 
@@ -180,7 +231,7 @@ public class NetworkMonitorWindow extends Window {
 	    } else if(idfilter != null) {
 		if(e.wdgid != idfilter)
 		    continue;
-	    } else if((needle != null) && !e.label.toLowerCase().contains(needle)) {
+	    } else if((needle != null) && !e.label().toLowerCase().contains(needle)) {
 		continue;
 	    }
 	    filtered.add(e);
@@ -205,8 +256,11 @@ public class NetworkMonitorWindow extends Window {
     }
 
     public void wdgmsg(Widget sender, String msg, Object... args) {
+	/* Destroy rather than hide: hiding would leave the log listener
+	 * attached, so the monitor would keep recording every packet for the
+	 * rest of the session after being opened once. ":netmon" rebuilds it. */
 	if((sender == this) && (msg == "close"))
-	    hide();
+	    destroy();
 	else
 	    super.wdgmsg(sender, msg, args);
     }
@@ -232,7 +286,7 @@ public class NetworkMonitorWindow extends Window {
 	    }
 
 	    private String text() {
-		return(String.format("%8.3f %-3s %s", item.time, (item.dir == NetPacketLog.Dir.OUT) ? "OUT" : "IN", item.label));
+		return(String.format("%8.3f %-3s %s", item.time, (item.dir == NetPacketLog.Dir.OUT) ? "OUT" : "IN", item.label()));
 	    }
 
 	    public void draw(GOut g) {

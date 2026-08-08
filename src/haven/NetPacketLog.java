@@ -1,12 +1,20 @@
 package haven;
 
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.*;
 
 /*
  * Central log of every reliable protocol message sent or received on a Session.
  * Fed from Session's single inbound (conncb.handle(PMessage)) and outbound
  * (queuemsg()) chokepoints, so this sees exactly what goes over the wire.
+ *
+ * record() runs on the network thread for every reliable message, so it stays
+ * as close to free as possible while nothing is watching: with no listeners
+ * attached (the monitor window is what attaches one) it stores nothing and only
+ * parses the few bytes of widget parentage out of NEWWDG/ADDWDG, so opening the
+ * window later still gets a usable widget tree. Message decoding for display is
+ * deferred to Entry.label(), off the network thread entirely.
  *
  * PMessage keeps entirely separate read (rbuf) and write (wbuf) buffers.
  * Freshly-built outbound messages only have their write side populated
@@ -17,6 +25,10 @@ import java.util.function.*;
  */
 public class NetPacketLog {
     public static final int maxlog = 2000;
+    /* Bounds the widget-parentage maps. These track ids the server has used,
+     * which churn over a long session, and DSTWDG pruning only reclaims what
+     * the server explicitly tears down -- so cap them as a backstop. */
+    public static final int maxwidgets = 20000;
 
     public enum Dir {IN, OUT}
 
@@ -30,34 +42,39 @@ public class NetPacketLog {
 	public final int wdgid;
 	/* WDGMSG message name (e.g. "click", "act"); null for other types. */
 	public final String wdgname;
-	public final String label;
+	/* Decoded one-line summary, computed on first use rather than on the
+	 * network thread. Benign race: two threads may both compute it, but
+	 * the result is deterministic, so either is equally correct. */
+	private volatile String label = null;
 
-	Entry(Dir dir, double time, int type, byte[] raw, int wdgid, String wdgname, String label) {
+	Entry(Dir dir, double time, int type, byte[] raw, int wdgid, String wdgname) {
 	    this.dir = dir;
 	    this.time = time;
 	    this.type = type;
 	    this.raw = raw;
 	    this.wdgid = wdgid;
 	    this.wdgname = wdgname;
-	    this.label = label;
 	}
-    }
 
-    public interface Filter {
-	boolean test(Entry e);
+	public String label() {
+	    String ret = label;
+	    if(ret == null)
+		label = ret = describe(type, raw);
+	    return(ret);
+	}
     }
 
     public final Session sess;
     private final Deque<Entry> log = new ArrayDeque<>();
-    private final List<Consumer<Entry>> listeners = new ArrayList<>();
-    private final Map<String, Filter> filters = new LinkedHashMap<>();
+    /* Copy-on-write: record() iterates this from the network thread while the
+     * UI thread can add/remove, and a plain list would risk a
+     * ConcurrentModificationException on the network thread. */
+    private final List<Consumer<Entry>> listeners = new CopyOnWriteArrayList<>();
     private final double epoch = Utils.rtime();
-    private volatile boolean paused = false;
     /* Widget parentage as observed from NEWWDG/ADDWDG traffic, kept separate
-     * from the bounded message log (and never pruned) so a subtree filter
-     * still works even after the creation message itself has aged out of
-     * the visible log. Ids can be reused after a DSTWDG, in which case a
-     * later NEWWDG for the same id just overwrites its old parent. */
+     * from the bounded message log so a subtree filter still works after the
+     * creation message itself has aged out. Pruned on DSTWDG; ids can also be
+     * reused, in which case a later NEWWDG just overwrites the old parent. */
     private final Map<Integer, Integer> parentOf = new HashMap<>();
     private final Map<Integer, Set<Integer>> childrenOf = new HashMap<>();
 
@@ -65,22 +82,31 @@ public class NetPacketLog {
 	this.sess = sess;
     }
 
-    public boolean paused() {return(paused);}
-    public void paused(boolean p) {paused = p;}
-
     public synchronized void record(Dir dir, PMessage msg) {
-	if(paused)
+	boolean observed = !listeners.isEmpty();
+	boolean parentage = (msg.type == RMessage.RMSG_NEWWDG) || (msg.type == RMessage.RMSG_ADDWDG) ||
+	    (msg.type == RMessage.RMSG_DSTWDG);
+	/* Nothing watching and nothing to learn about the widget tree: don't
+	 * even copy the payload. This is the common case during normal play. */
+	if(!observed && !parentage)
 	    return;
 	/* Outbound messages are freshly written and only have wbuf populated;
 	 * inbound messages arrive with only rbuf populated. Pull raw bytes
 	 * from whichever side actually has the data. */
 	byte[] raw = (dir == Dir.OUT) ? msg.fin() : new PMessage(msg).bytes();
 	int wid = wdgid(msg.type, raw);
-	int parent = parentid(msg.type, raw);
-	if((wid >= 0) && (parent >= 0))
-	    notewidget(wid, parent);
-	Entry e = new Entry(dir, Utils.rtime() - epoch, msg.type, raw,
-			     wid, wdgname(msg.type, raw), describe(msg.type, raw));
+	if(parentage && (wid >= 0)) {
+	    if(msg.type == RMessage.RMSG_DSTWDG) {
+		forget(wid);
+	    } else {
+		int parent = parentid(msg.type, raw);
+		if(parent >= 0)
+		    notewidget(wid, parent);
+	    }
+	}
+	if(!observed)
+	    return;
+	Entry e = new Entry(dir, Utils.rtime() - epoch, msg.type, raw, wid, wdgname(msg.type, raw));
 	log.addLast(e);
 	while(log.size() > maxlog)
 	    log.removeFirst();
@@ -92,15 +118,8 @@ public class NetPacketLog {
 	return(new ArrayList<>(log));
     }
 
-    public synchronized List<Entry> entries(Filter f) {
-	if(f == null)
-	    return(entries());
-	List<Entry> ret = new ArrayList<>();
-	for(Entry e : log) {
-	    if(f.test(e))
-		ret.add(e);
-	}
-	return(ret);
+    public synchronized int size() {
+	return(log.size());
     }
 
     public synchronized void clear() {
@@ -108,24 +127,11 @@ public class NetPacketLog {
     }
 
     public void addListener(Consumer<Entry> l) {
-	synchronized(listeners) {listeners.add(l);}
+	listeners.add(l);
     }
 
     public void removeListener(Consumer<Entry> l) {
-	synchronized(listeners) {listeners.remove(l);}
-    }
-
-    /* Named, toggleable filters that other dev tools can register against this log. */
-    public void addFilter(String name, Filter f) {
-	synchronized(filters) {filters.put(name, f);}
-    }
-
-    public void removeFilter(String name) {
-	synchronized(filters) {filters.remove(name);}
-    }
-
-    public Map<String, Filter> filters() {
-	synchronized(filters) {return(new LinkedHashMap<>(filters));}
+	listeners.remove(l);
     }
 
     /* Requeues a previously captured outbound message as a fresh send. */
@@ -187,6 +193,10 @@ public class NetPacketLog {
     }
 
     private void notewidget(int id, int parent) {
+	if(parentOf.size() >= maxwidgets) {
+	    parentOf.clear();
+	    childrenOf.clear();
+	}
 	Integer old = parentOf.put(id, parent);
 	if((old != null) && (old.intValue() != parent)) {
 	    Set<Integer> oldkids = childrenOf.get(old);
@@ -194,6 +204,28 @@ public class NetPacketLog {
 		oldkids.remove(id);
 	}
 	childrenOf.computeIfAbsent(parent, k -> new HashSet<>()).add(id);
+    }
+
+    /* Drop a destroyed widget and everything under it. The server only sends
+     * DSTWDG for the top of a destroyed subtree; its descendants go away with
+     * it silently, so reclaim them here too. */
+    private void forget(int id) {
+	Integer parent = parentOf.remove(id);
+	if(parent != null) {
+	    Set<Integer> sibs = childrenOf.get(parent);
+	    if(sibs != null) {
+		sibs.remove(id);
+		if(sibs.isEmpty())
+		    childrenOf.remove(parent);
+	    }
+	}
+	Set<Integer> kids = childrenOf.remove(id);
+	if(kids != null) {
+	    for(int kid : kids) {
+		parentOf.remove(kid);
+		forget(kid);
+	    }
+	}
     }
 
     /* id plus every widget transitively created under it, as observed from
@@ -283,7 +315,7 @@ public class NetPacketLog {
 		return(String.format("%s %s=%s", tn, key, val));
 	    }
 	} catch(Exception ex) {
-	    /* Fall through to raw preview below. */
+	    /* Fall through to the size-only summary below. */
 	}
 	return(String.format("%s (%d bytes)", tn, raw.length));
     }
@@ -305,6 +337,9 @@ public class NetPacketLog {
     }
 
     private static final int valuestrMaxDepth = 8;
+    /* Caps how much of one message's decoded arguments can land in a single
+     * log line. Argument lists are server-controlled and unbounded. */
+    private static final int valuestrMaxLen = 512;
 
     /* Arrays.toString() doesn't recurse into nested arrays -- it just calls
      * Object.toString() on them, which for an array is the useless default
@@ -312,33 +347,52 @@ public class NetPacketLog {
      * "tip") nest Object[] inside Object[] (an ItemInfo.Raw-style encoding),
      * so format those recursively instead. Depth-capped defensively, not
      * because nesting this deep is expected. */
-    private static String valuestr(Object o) {return(valuestr(o, 0));}
+    private static String valuestr(Object o) {
+	StringBuilder buf = new StringBuilder();
+	valuestr(buf, o, 0);
+	if(buf.length() > valuestrMaxLen)
+	    return(buf.substring(0, valuestrMaxLen) + "...");
+	return(buf.toString());
+    }
 
-    private static String valuestr(Object o, int depth) {
-	if(o == null)
-	    return("null");
-	if(o instanceof byte[])
-	    return(rawpreview((byte[])o));
-	if(o instanceof Object[]) {
-	    if(depth >= valuestrMaxDepth)
-		return("[...]");
+    private static void valuestr(StringBuilder buf, Object o, int depth) {
+	if(buf.length() > valuestrMaxLen)
+	    return;
+	if(o == null) {
+	    buf.append("null");
+	} else if(o instanceof byte[]) {
+	    buf.append(rawpreview((byte[])o));
+	} else if(o instanceof Object[]) {
+	    if(depth >= valuestrMaxDepth) {
+		buf.append("[...]");
+		return;
+	    }
 	    Object[] arr = (Object[])o;
-	    StringBuilder buf = new StringBuilder("[");
+	    buf.append('[');
 	    for(int i = 0; i < arr.length; i++) {
 		if(i > 0)
 		    buf.append(", ");
-		buf.append(valuestr(arr[i], depth + 1));
+		if(buf.length() > valuestrMaxLen) {
+		    buf.append("...");
+		    break;
+		}
+		valuestr(buf, arr[i], depth + 1);
 	    }
-	    return(buf.append(']').toString());
+	    buf.append(']');
+	} else {
+	    buf.append(o);
 	}
-	return(String.valueOf(o));
     }
 
     private static String typestr(Object o) {
 	return((o == null) ? "null" : o.getClass().getSimpleName());
     }
 
+    /* Caps on how much one message can expand to in the detail panel. Each
+     * line becomes a widget there, and argument lists come from the server,
+     * so both the per-level width and the grand total are bounded. */
     private static final int maxArgLines = 100;
+    private static final int maxDetailLines = 400;
 
     private static String indent(int depth) {
 	StringBuilder buf = new StringBuilder();
@@ -353,6 +407,8 @@ public class NetPacketLog {
      * walk nested arrays and give each leaf value its own indented line
      * instead. */
     private static void appendarg(List<String> lines, String label, Object val, int depth) {
+	if(lines.size() >= maxDetailLines)
+	    return;
 	String pad = indent(depth);
 	if(val instanceof Object[]) {
 	    Object[] arr = (Object[])val;
@@ -451,7 +507,7 @@ public class NetPacketLog {
 	    }
 	    case RMessage.RMSG_WDGBAR: {
 		List<Integer> deps = new ArrayList<>();
-		while(!cp.eom()) {
+		while(!cp.eom() && (deps.size() < maxArgLines)) {
 		    int dep = cp.int32();
 		    if(dep == -1)
 			break;
@@ -460,7 +516,7 @@ public class NetPacketLog {
 		List<Integer> bars = deps;
 		if(!cp.eom()) {
 		    bars = new ArrayList<>();
-		    while(!cp.eom()) {
+		    while(!cp.eom() && (bars.size() < maxArgLines)) {
 			int bar = cp.int32();
 			if(bar == -1)
 			    break;
@@ -482,6 +538,10 @@ public class NetPacketLog {
 	    }
 	} catch(Exception ex) {
 	    lines.add("(failed to decode: " + ex + ")");
+	}
+	if(lines.size() > maxDetailLines) {
+	    lines = new ArrayList<>(lines.subList(0, maxDetailLines));
+	    lines.add("... (truncated)");
 	}
 	return(lines);
     }

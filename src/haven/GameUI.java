@@ -2335,11 +2335,13 @@ public class GameUI extends ConsoleHost implements Console.Directory, UI.Notice.
 		public void run(Console cons, String[] args) {
 		    if(ui.sess == null)
 			return;
-		    if(netmonwnd == null || netmonwnd.parent == null) {
-			netmonwnd = add(new NetworkMonitorWindow(ui.sess), Utils.getprefc("wndc-netmon", new Coord(200, 200)));
+		    /* Toggles open/closed. Closing destroys it so the packet
+		     * log stops recording; it saves its own position first. */
+		    if((netmonwnd != null) && (netmonwnd.parent != null)) {
+			netmonwnd.destroy();
+			netmonwnd = null;
 		    } else {
-			Utils.setprefc("wndc-netmon", netmonwnd.c);
-			netmonwnd.show(!netmonwnd.visible());
+			netmonwnd = add(new NetworkMonitorWindow(ui.sess), Utils.getprefc("wndc-netmon", new Coord(200, 200)));
 		    }
 		}
 	    });
