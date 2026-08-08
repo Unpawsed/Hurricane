@@ -65,7 +65,7 @@ public class GameUI extends ConsoleHost implements Console.Directory, UI.Notice.
     private List<Widget> meters = new LinkedList<Widget>();
     private Text lastmsg;
     private double msgtime;
-    private Window invwnd, equwnd, /*makewnd,*/ srchwnd, iconwnd;
+    private Window invwnd, equwnd, /*makewnd,*/ srchwnd, iconwnd, netmonwnd;
 	public CraftWindow makewnd;
 	public Inventory maininv;
 	public ExtInventory maininvext;
@@ -2329,6 +2329,18 @@ public class GameUI extends ConsoleHost implements Console.Directory, UI.Notice.
 	cmdmap.put("chrmap", new Console.Command() {
 		public void run(Console cons, String[] args) {
 		    Utils.setpref("mapfile/" + chrid, args[1]);
+		}
+	    });
+	cmdmap.put("netmon", new Console.Command() {
+		public void run(Console cons, String[] args) {
+		    if(ui.sess == null)
+			return;
+		    if(netmonwnd == null || netmonwnd.parent == null) {
+			netmonwnd = add(new NetworkMonitorWindow(ui.sess), Utils.getprefc("wndc-netmon", new Coord(200, 200)));
+		    } else {
+			Utils.setprefc("wndc-netmon", netmonwnd.c);
+			netmonwnd.show(!netmonwnd.visible());
+		    }
 		}
 	    });
 	cmdmap.put("tool", new Console.Command() {

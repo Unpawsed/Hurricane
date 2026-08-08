@@ -63,6 +63,7 @@ public class Session implements Resource.Resolver {
     public final User user;
     final Map<Integer, CachedRes> rescache = new TreeMap<Integer, CachedRes>();
     public final Glob glob;
+    public final NetPacketLog netlog = new NetPacketLog(this);
     public SignKey sesskey;
     private boolean closed = false;
 	public UI ui;
@@ -257,6 +258,7 @@ public class Session implements Resource.Resolver {
 	    }
 
 	    public void handle(PMessage msg) {
+		netlog.record(NetPacketLog.Dir.IN, msg);
 		handlerel(msg);
 	    }
 
@@ -297,6 +299,7 @@ public class Session implements Resource.Resolver {
     }
 
     public void queuemsg(PMessage pmsg) {
+	netlog.record(NetPacketLog.Dir.OUT, pmsg);
 	conn.queuemsg(pmsg);
     }
 
